@@ -203,6 +203,9 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Generated meeting notes
+meeting_summary/output/
+
 # Ruff stuff:
 .ruff_cache/
 
