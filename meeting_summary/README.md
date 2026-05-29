@@ -40,6 +40,12 @@ Use `--output` to choose a specific Markdown path:
 python meeting_summary\main.py meeting "C:\path\to\meeting.m4a" --output ".\notes.md"
 ```
 
+Logs are written to stderr with local timestamps:
+
+```text
+[2026-05-30 00:15:12] Transcribing chunk 1/2 (00:00:00-00:20:00)...
+```
+
 ## Modes
 
 - `transcript`: timestamped transcript only.
@@ -52,6 +58,14 @@ python meeting_summary\main.py meeting "C:\path\to\meeting.m4a" --output ".\note
 - MP4 and other video inputs are treated as audio sources; video frames are not analyzed.
 - Inputs longer than 2 hours are rejected by default. Override with `--max-hours`.
 - Audio is split into 20-minute chunks by default. Override with `--chunk-minutes`.
+- Converted MP3 and chunks are cached beside the input file under `.meeting_summary_cache`.
+  If a Gemini call fails, rerun the same command and the CLI will reuse the cached
+  MP3/chunks instead of converting the source video/audio again.
+- Chunk-level Gemini responses are also cached in the same directory. If `meeting`
+  mode finishes transcript extraction but fails while creating the final summary,
+  rerunning the command reuses the cached chunk transcripts.
+- Use `--no-cache` to force temporary conversion and delete intermediate media after
+  the run.
 
 ## Output Policy
 

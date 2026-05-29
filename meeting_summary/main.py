@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CHUNK_MINUTES = 20.0
 DEFAULT_MAX_HOURS = 2.0
 DEFAULT_MAX_OUTPUT_TOKENS = 65536
+MEDIA_CACHE_VERSION = "v1-mono16k-64k"
 
 T = TypeVar("T")
 
@@ -82,6 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="Retry count for upload/generation calls. Default: 3.",
+    )
+    common.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Do not reuse the local MP3/chunk cache next to the input file.",
     )
 
     subparsers.add_parser(
@@ -163,6 +170,7 @@ def require_media_tools() -> None:
 
 
 def run_tool(args: Sequence[str], label: str) -> str:
+    log(f"Running {label}...")
     try:
         completed = subprocess.run(
             list(args),
@@ -180,6 +188,21 @@ def run_tool(args: Sequence[str], label: str) -> str:
             detail = f"exit code {exc.returncode}"
         raise MeetingSummaryError(f"{label} failed: {detail}") from exc
     return completed.stdout.strip()
+
+
+def log(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}", file=sys.stderr)
+
+
+def format_bytes(size: int) -> str:
+    units = ("B", "KB", "MB", "GB")
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"
 
 
 def get_duration_seconds(path: Path) -> float:
@@ -209,6 +232,14 @@ def get_duration_seconds(path: Path) -> float:
 
 def normalize_to_mp3(input_path: Path, work_dir: Path) -> Path:
     output_path = work_dir / "normalized.mp3"
+    if output_path.exists() and output_path.stat().st_size > 0:
+        log(
+            "Reusing cached normalized MP3: "
+            f"{output_path} ({format_bytes(output_path.stat().st_size)})"
+        )
+        return output_path
+
+    log("Converting source media to mono 16 kHz / 64 kbps MP3...")
     run_tool(
         [
             "ffmpeg",
@@ -233,6 +264,10 @@ def normalize_to_mp3(input_path: Path, work_dir: Path) -> Path:
     )
     if not output_path.exists():
         raise MeetingSummaryError("ffmpeg did not create the normalized MP3.")
+    log(
+        "Normalized MP3 created: "
+        f"{output_path} ({format_bytes(output_path.stat().st_size)})"
+    )
     return output_path
 
 
@@ -242,12 +277,28 @@ def split_audio(normalized_path: Path, chunk_minutes: float, work_dir: Path) -> 
         raise MeetingSummaryError("--chunk-minutes must be greater than 0.")
 
     duration = get_duration_seconds(normalized_path)
+    log(
+        "Normalized audio duration: "
+        f"{format_time(duration)}; chunk size: {format_time(chunk_seconds)}"
+    )
     if duration <= chunk_seconds + 0.5:
+        log("Audio fits in one chunk; using normalized MP3 directly.")
         return [normalized_path]
 
     chunks_dir = work_dir / "chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
+    cached_chunks = sorted(chunks_dir.glob("chunk_*.mp3"))
+    if cached_chunks and chunk_cache_is_valid(cached_chunks, duration):
+        log(
+            f"Reusing {len(cached_chunks)} cached audio chunk(s) from {chunks_dir}."
+        )
+        return cached_chunks
+
+    for stale_chunk in cached_chunks:
+        stale_chunk.unlink()
+
     pattern = chunks_dir / "chunk_%04d.mp3"
+    log(f"Splitting audio into {chunk_minutes:g}-minute chunks...")
     run_tool(
         [
             "ffmpeg",
@@ -273,7 +324,22 @@ def split_audio(normalized_path: Path, chunk_minutes: float, work_dir: Path) -> 
     chunks = sorted(chunks_dir.glob("chunk_*.mp3"))
     if not chunks:
         raise MeetingSummaryError("ffmpeg did not create audio chunks.")
+    log(f"Created {len(chunks)} audio chunk(s) in {chunks_dir}.")
     return chunks
+
+
+def chunk_cache_is_valid(chunks: list[Path], source_duration: float) -> bool:
+    try:
+        total_duration = sum(get_duration_seconds(chunk) for chunk in chunks)
+    except MeetingSummaryError:
+        return False
+    valid = total_duration >= source_duration - 1.0
+    if not valid:
+        log(
+            "Cached chunks are incomplete; "
+            f"found {format_time(total_duration)} for source {format_time(source_duration)}."
+        )
+    return valid
 
 
 def build_chunk_metadata(paths: list[Path]) -> list[AudioChunk]:
@@ -282,6 +348,11 @@ def build_chunk_metadata(paths: list[Path]) -> list[AudioChunk]:
     total = len(paths)
     for index, path in enumerate(paths, start=1):
         duration = get_duration_seconds(path)
+        log(
+            f"Chunk {index}/{total}: {path.name}, "
+            f"{format_time(offset)}-{format_time(offset + duration)}, "
+            f"{format_bytes(path.stat().st_size)}"
+        )
         chunks.append(
             AudioChunk(
                 path=path,
@@ -304,6 +375,7 @@ def make_client(api_key: str):
             "Missing Python dependency. Run: "
             "python -m pip install -r meeting_summary/requirements.txt"
         ) from exc
+    log("Gemini client initialized.")
     return genai.Client(api_key=api_key), types
 
 
@@ -319,16 +391,16 @@ def retry(operation: Callable[[], T], description: str, attempts: int) -> T:
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
+            log(f"{description}: attempt {attempt}/{attempts}.")
             return operation()
         except Exception as exc:  # SDK exceptions vary by transport.
             last_error = exc
             if attempt == attempts:
                 break
             delay = min(2 ** (attempt - 1), 8)
-            print(
+            log(
                 f"{description} failed on attempt {attempt}/{attempts}; "
-                f"retrying in {delay}s...",
-                file=sys.stderr,
+                f"retrying in {delay}s... ({exc})"
             )
             time.sleep(delay)
     raise MeetingSummaryError(
@@ -350,6 +422,7 @@ def wait_until_active(client, file_obj, timeout_seconds: int = 300):
     while True:
         state_name = file_state_name(current)
         if state_name in (None, "ACTIVE"):
+            log(f"Uploaded file is ready: {getattr(current, 'name', 'unknown')}")
             return current
         if state_name in ("FAILED", "ERROR"):
             raise MeetingSummaryError(f"Uploaded file processing failed: {state_name}")
@@ -357,6 +430,10 @@ def wait_until_active(client, file_obj, timeout_seconds: int = 300):
             raise MeetingSummaryError(
                 f"Timed out waiting for uploaded file to become ACTIVE: {state_name}"
             )
+        log(
+            "Waiting for uploaded file processing: "
+            f"{getattr(current, 'name', 'unknown')} state={state_name}"
+        )
         time.sleep(5)
         current = client.files.get(name=current.name)
 
@@ -389,6 +466,10 @@ def generate_from_file(
 ) -> str:
     uploaded = None
     try:
+        log(
+            f"Uploading chunk file: {chunk_path.name} "
+            f"({format_bytes(chunk_path.stat().st_size)})"
+        )
         uploaded = retry(
             lambda: client.files.upload(file=str(chunk_path)),
             "Gemini file upload",
@@ -396,6 +477,7 @@ def generate_from_file(
         )
         uploaded = wait_until_active(client, uploaded)
         config = generation_config(types, max_output_tokens)
+        log(f"Generating content with model {model} from uploaded chunk...")
         response = retry(
             lambda: client.models.generate_content(
                 model=model,
@@ -405,15 +487,17 @@ def generate_from_file(
             "Gemini content generation",
             retries,
         )
-        return response_text(response)
+        text = response_text(response)
+        log(f"Gemini returned {len(text):,} character(s) for chunk file.")
+        return text
     finally:
         if uploaded is not None:
             try:
                 client.files.delete(name=uploaded.name)
+                log(f"Deleted uploaded Gemini file: {uploaded.name}")
             except Exception as exc:
-                print(
+                log(
                     f"Warning: could not delete uploaded file {uploaded.name}: {exc}",
-                    file=sys.stderr,
                 )
 
 
@@ -426,6 +510,10 @@ def generate_from_text(
     retries: int,
 ) -> str:
     config = generation_config(types, max_output_tokens)
+    log(
+        f"Generating content with model {model} from text prompt "
+        f"({len(prompt):,} character(s))..."
+    )
     response = retry(
         lambda: client.models.generate_content(
             model=model,
@@ -435,7 +523,9 @@ def generate_from_text(
         "Gemini content generation",
         retries,
     )
-    return response_text(response)
+    text = response_text(response)
+    log(f"Gemini returned {len(text):,} character(s) from text prompt.")
+    return text
 
 
 def transcript_prompt(chunk: AudioChunk) -> str:
@@ -518,26 +608,49 @@ def generate_transcript(
     chunks: list[AudioChunk],
     max_output_tokens: int,
     retries: int,
+    response_cache_dir: Path | None,
 ) -> str:
     parts: list[str] = []
     for chunk in chunks:
-        print(
+        log(
             f"Transcribing chunk {chunk.index}/{chunk.total} "
-            f"({format_time(chunk.start_seconds)}-{format_time(chunk.end_seconds)})...",
-            file=sys.stderr,
+            f"({format_time(chunk.start_seconds)}-{format_time(chunk.end_seconds)})..."
+        )
+        prompt = transcript_prompt(chunk)
+        cached = read_cached_response(
+            response_cache_dir,
+            model,
+            "transcript",
+            chunk,
+            prompt,
+        )
+        if cached is not None:
+            parts.append(cached)
+            continue
+
+        text = generate_from_file(
+            client,
+            types,
+            model,
+            chunk.path,
+            prompt,
+            max_output_tokens,
+            retries,
+        )
+        write_cached_response(
+            response_cache_dir,
+            model,
+            "transcript",
+            chunk,
+            prompt,
+            text,
         )
         parts.append(
-            generate_from_file(
-                client,
-                types,
-                model,
-                chunk.path,
-                transcript_prompt(chunk),
-                max_output_tokens,
-                retries,
-            )
+            text
         )
-    return "\n\n".join(part.strip() for part in parts if part.strip())
+    transcript = "\n\n".join(part.strip() for part in parts if part.strip())
+    log(f"Combined transcript length: {len(transcript):,} character(s).")
+    return transcript
 
 
 def generate_compact_notes(
@@ -547,24 +660,45 @@ def generate_compact_notes(
     chunks: list[AudioChunk],
     max_output_tokens: int,
     retries: int,
+    response_cache_dir: Path | None,
 ) -> str:
     chunk_notes: list[str] = []
     for chunk in chunks:
-        print(
+        log(
             f"Summarizing chunk {chunk.index}/{chunk.total} "
-            f"({format_time(chunk.start_seconds)}-{format_time(chunk.end_seconds)})...",
-            file=sys.stderr,
+            f"({format_time(chunk.start_seconds)}-{format_time(chunk.end_seconds)})..."
+        )
+        prompt = chunk_compact_prompt(chunk)
+        cached = read_cached_response(
+            response_cache_dir,
+            model,
+            "compact_chunk",
+            chunk,
+            prompt,
+        )
+        if cached is not None:
+            chunk_notes.append(cached)
+            continue
+
+        text = generate_from_file(
+            client,
+            types,
+            model,
+            chunk.path,
+            prompt,
+            max_output_tokens,
+            retries,
+        )
+        write_cached_response(
+            response_cache_dir,
+            model,
+            "compact_chunk",
+            chunk,
+            prompt,
+            text,
         )
         chunk_notes.append(
-            generate_from_file(
-                client,
-                types,
-                model,
-                chunk.path,
-                chunk_compact_prompt(chunk),
-                max_output_tokens,
-                retries,
-            )
+            text
         )
 
     combined = "\n\n".join(
@@ -572,7 +706,10 @@ def generate_compact_notes(
         for index, note in enumerate(chunk_notes)
         if note.strip()
     )
-    print("Creating final compact meeting notes...", file=sys.stderr)
+    log(
+        "Creating final compact meeting notes from "
+        f"{len(combined):,} character(s) of chunk notes..."
+    )
     return generate_from_text(
         client,
         types,
@@ -642,6 +779,84 @@ def default_output_path(input_file: Path, mode: str) -> Path:
     raise MeetingSummaryError("Could not create a unique output path.")
 
 
+def read_cached_response(
+    cache_dir: Path | None,
+    model: str,
+    label: str,
+    chunk: AudioChunk,
+    prompt: str,
+) -> str | None:
+    if cache_dir is None:
+        return None
+    path = response_cache_path(cache_dir, model, label, chunk, prompt)
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return None
+    log(
+        f"Reusing cached Gemini response for {label} chunk "
+        f"{chunk.index}/{chunk.total}: {path}"
+    )
+    return text
+
+
+def write_cached_response(
+    cache_dir: Path | None,
+    model: str,
+    label: str,
+    chunk: AudioChunk,
+    prompt: str,
+    text: str,
+) -> None:
+    if cache_dir is None:
+        return
+    path = response_cache_path(cache_dir, model, label, chunk, prompt)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text.strip() + "\n", encoding="utf-8")
+    log(f"Cached Gemini response: {path}")
+
+
+def response_cache_path(
+    cache_dir: Path,
+    model: str,
+    label: str,
+    chunk: AudioChunk,
+    prompt: str,
+) -> Path:
+    cache_source = "|".join(
+        [
+            MEDIA_CACHE_VERSION,
+            model,
+            label,
+            chunk.path.name,
+            str(chunk.path.stat().st_size),
+            format_time(chunk.start_seconds),
+            format_time(chunk.end_seconds),
+            prompt,
+        ]
+    )
+    digest = hashlib.sha1(cache_source.encode("utf-8")).hexdigest()[:12]
+    filename = f"{label}_chunk_{chunk.index:04d}_{digest}.md"
+    return cache_dir / "gemini_responses" / filename
+
+
+def media_cache_dir(input_file: Path, chunk_minutes: float) -> Path:
+    stat = input_file.stat()
+    chunk_seconds = int(round(chunk_minutes * 60))
+    cache_source = "|".join(
+        [
+            MEDIA_CACHE_VERSION,
+            str(input_file).casefold(),
+            str(stat.st_size),
+            str(stat.st_mtime_ns),
+            str(chunk_seconds),
+        ]
+    )
+    digest = hashlib.sha1(cache_source.encode("utf-8")).hexdigest()[:12]
+    return input_file.parent / ".meeting_summary_cache" / f"{sanitize_filename(input_file.stem)}_{digest}"
+
+
 def sanitize_filename(stem: str) -> str:
     invalid = '<>:"/\\|?*'
     sanitized = "".join("_" if char in invalid else char for char in stem)
@@ -676,12 +891,19 @@ def validate_args(args: argparse.Namespace) -> Path:
 
 def run(args: argparse.Namespace) -> Path:
     input_file = validate_args(args)
+    log(f"Starting mode: {args.mode}")
+    log(f"Input file: {input_file}")
     load_local_env()
     api_key = resolve_api_key()
     model = resolve_model(args.model)
+    log(f"Model: {model}")
     require_media_tools()
 
     duration = get_duration_seconds(input_file)
+    log(
+        f"Input duration: {format_time(duration)}; "
+        f"size: {format_bytes(input_file.stat().st_size)}"
+    )
     max_seconds = args.max_hours * 3600
     if duration > max_seconds:
         raise MeetingSummaryError(
@@ -691,14 +913,24 @@ def run(args: argparse.Namespace) -> Path:
 
     client, types = make_client(api_key)
 
-    with tempfile.TemporaryDirectory(prefix="meeting_summary_") as temp_dir_name:
-        temp_dir = Path(temp_dir_name)
-        print("Normalizing media to mono MP3...", file=sys.stderr)
-        normalized = normalize_to_mp3(input_file, temp_dir)
+    temp_context = None
+    if args.no_cache:
+        temp_context = tempfile.TemporaryDirectory(prefix="meeting_summary_")
+        work_dir = Path(temp_context.name)
+        response_cache_dir = None
+        log(f"Media cache disabled; using temporary work directory: {work_dir}")
+    else:
+        work_dir = media_cache_dir(input_file, args.chunk_minutes)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        response_cache_dir = work_dir
+        log(f"Media cache directory: {work_dir}")
 
-        print("Splitting audio into chunks...", file=sys.stderr)
-        chunk_paths = split_audio(normalized, args.chunk_minutes, temp_dir)
+    try:
+        normalized = normalize_to_mp3(input_file, work_dir)
+
+        chunk_paths = split_audio(normalized, args.chunk_minutes, work_dir)
         chunks = build_chunk_metadata(chunk_paths)
+        log(f"Prepared {len(chunks)} chunk(s) for Gemini processing.")
 
         transcript: str | None = None
         notes: str | None = None
@@ -710,6 +942,7 @@ def run(args: argparse.Namespace) -> Path:
                 chunks,
                 args.max_output_tokens,
                 args.retries,
+                response_cache_dir,
             )
         elif args.mode == "meeting":
             transcript = generate_transcript(
@@ -719,8 +952,9 @@ def run(args: argparse.Namespace) -> Path:
                 chunks,
                 args.max_output_tokens,
                 args.retries,
+                response_cache_dir,
             )
-            print("Creating final meeting summary and action items...", file=sys.stderr)
+            log("Creating final meeting summary and action items from transcript...")
             notes = generate_from_text(
                 client,
                 types,
@@ -737,9 +971,13 @@ def run(args: argparse.Namespace) -> Path:
                 chunks,
                 args.max_output_tokens,
                 args.retries,
+                response_cache_dir,
             )
         else:
             raise MeetingSummaryError(f"Unsupported mode: {args.mode}")
+    finally:
+        if temp_context is not None:
+            temp_context.cleanup()
 
     output_path = args.output or default_output_path(input_file, args.mode)
     output_path = output_path.expanduser().resolve()
@@ -755,6 +993,7 @@ def run(args: argparse.Namespace) -> Path:
         notes=notes,
     )
     output_path.write_text(markdown, encoding="utf-8")
+    log(f"Markdown written: {output_path} ({format_bytes(output_path.stat().st_size)})")
     return output_path
 
 
@@ -764,10 +1003,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         output_path = run(args)
     except MeetingSummaryError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        log(f"Error: {exc}")
         return 1
     except KeyboardInterrupt:
-        print("Interrupted.", file=sys.stderr)
+        log("Interrupted.")
         return 130
     print(f"Wrote {output_path}")
     return 0

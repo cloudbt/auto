@@ -205,6 +205,7 @@ tempCodeRunnerFile.py
 
 # Generated meeting notes
 meeting_summary/output/
+**/.meeting_summary_cache/
 
 # Ruff stuff:
 .ruff_cache/
