@@ -34,10 +34,23 @@ Output defaults to:
 meeting_summary/output/<input_stem>_<mode>_<YYYYMMDD-HHMMSS>.md
 ```
 
+The same Markdown file is also copied to:
+
+```text
+C:\Users\whz\iCloudDrive\iCloud~md~obsidian\work\work\MeetingSummary
+```
+
 Use `--output` to choose a specific Markdown path:
 
 ```powershell
 python meeting_summary\main.py meeting "C:\path\to\meeting.m4a" --output ".\notes.md"
+```
+
+Use `--copy-to` to change the extra copy folder, or `--no-copy` to disable the
+extra copy:
+
+```powershell
+python meeting_summary\main.py meeting "C:\path\to\meeting.m4a" --no-copy
 ```
 
 Logs are written to stderr with local timestamps:

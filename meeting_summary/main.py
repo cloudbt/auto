@@ -20,6 +20,9 @@ DEFAULT_CHUNK_MINUTES = 20.0
 DEFAULT_MAX_HOURS = 2.0
 DEFAULT_MAX_OUTPUT_TOKENS = 65536
 MEDIA_CACHE_VERSION = "v1-mono16k-64k"
+DEFAULT_COPY_OUTPUT_DIR = Path(
+    r"C:\Users\whz\iCloudDrive\iCloud~md~obsidian\work\work\MeetingSummary"
+)
 
 T = TypeVar("T")
 
@@ -89,6 +92,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-cache",
         action="store_true",
         help="Do not reuse the local MP3/chunk cache next to the input file.",
+    )
+    common.add_argument(
+        "--copy-to",
+        type=Path,
+        default=DEFAULT_COPY_OUTPUT_DIR,
+        help=(
+            "Also copy the final Markdown file to this directory. "
+            f"Default: {DEFAULT_COPY_OUTPUT_DIR}"
+        ),
+    )
+    common.add_argument(
+        "--no-copy",
+        action="store_true",
+        help="Do not copy the final Markdown file to the Obsidian/iCloud folder.",
     )
 
     subparsers.add_parser(
@@ -779,6 +796,26 @@ def default_output_path(input_file: Path, mode: str) -> Path:
     raise MeetingSummaryError("Could not create a unique output path.")
 
 
+def copy_markdown_output(output_path: Path, copy_to_dir: Path | None) -> Path | None:
+    if copy_to_dir is None:
+        return None
+
+    destination_dir = copy_to_dir.expanduser().resolve()
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination_path = destination_dir / output_path.name
+
+    if output_path.resolve() == destination_path.resolve():
+        log(f"Markdown copy skipped; destination is the primary output: {output_path}")
+        return destination_path
+
+    shutil.copy2(output_path, destination_path)
+    log(
+        "Markdown copied: "
+        f"{destination_path} ({format_bytes(destination_path.stat().st_size)})"
+    )
+    return destination_path
+
+
 def read_cached_response(
     cache_dir: Path | None,
     model: str,
@@ -994,6 +1031,10 @@ def run(args: argparse.Namespace) -> Path:
     )
     output_path.write_text(markdown, encoding="utf-8")
     log(f"Markdown written: {output_path} ({format_bytes(output_path.stat().st_size)})")
+    if args.no_copy:
+        log("Markdown copy disabled by --no-copy.")
+    else:
+        copy_markdown_output(output_path, args.copy_to)
     return output_path
 
 
