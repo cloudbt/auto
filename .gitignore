@@ -205,6 +205,8 @@ tempCodeRunnerFile.py
 
 # Generated meeting notes
 meeting_summary/output/
+meeting_summary/telegram_downloads/
+meeting_summary/telegram_bot.log
 **/.meeting_summary_cache/
 
 # Ruff stuff:

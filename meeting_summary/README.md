@@ -16,6 +16,8 @@ Edit `meeting_summary/.env` and set:
 ```text
 GEMINI_API_KEY=your_api_key_here
 GEMINI_MODEL=gemini-3.5-flash
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+TELEGRAM_ALLOWED_CHAT_IDS=123456789
 ```
 
 `meeting_summary/.env` is ignored by git through the repository `.gitignore`.
@@ -92,3 +94,22 @@ Logs are written to stderr with local timestamps:
 - Python 3.9+
 - `ffmpeg` and `ffprobe` on `PATH`
 - Gemini API key
+
+## Telegram Bot
+
+Run the Telegram entrypoint:
+
+```powershell
+python meeting_summary\telegram_bot.py
+```
+
+Bot behavior:
+
+- `/meeting`, `/transcript`, `/compact`: choose the mode, then send an audio or video file.
+- Direct file upload without a command uses `meeting` mode.
+- Supported Telegram file types: document, video, audio, voice.
+- On success, the bot sends the generated Markdown file back.
+- On failure, the bot edits the status message with the error text.
+
+Set `TELEGRAM_ALLOWED_CHAT_IDS` to a comma-separated allow-list. If it is empty,
+the bot accepts messages from any chat that can reach the bot.
