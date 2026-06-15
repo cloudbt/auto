@@ -42,6 +42,13 @@ The same Markdown file is also copied to:
 C:\Users\whz\iCloudDrive\iCloud~md~obsidian\work\work\MeetingSummary
 ```
 
+After the Markdown file is generated, it is also pushed to the `main` branch of
+`https://github.com/cloudbt/dev.git` under:
+
+```text
+meeting/<generated_markdown_filename>.md
+```
+
 Use `--output` to choose a specific Markdown path:
 
 ```powershell
@@ -53,6 +60,13 @@ extra copy:
 
 ```powershell
 python meeting_summary\main.py meeting "C:\path\to\meeting.m4a" --no-copy
+```
+
+Use `--no-publish` to skip the GitHub push, or override the publish target:
+
+```powershell
+python meeting_summary\main.py meeting "C:\path\to\meeting.m4a" --no-publish
+python meeting_summary\main.py meeting "C:\path\to\meeting.m4a" --publish-github-dir meeting
 ```
 
 Logs are written to stderr with local timestamps:

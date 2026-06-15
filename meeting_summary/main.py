@@ -23,6 +23,9 @@ MEDIA_CACHE_VERSION = "v1-mono16k-64k"
 DEFAULT_COPY_OUTPUT_DIR = Path(
     r"C:\Users\whz\iCloudDrive\iCloud~md~obsidian\work\work\MeetingSummary"
 )
+DEFAULT_PUBLISH_GITHUB_REPO = "https://github.com/cloudbt/dev.git"
+DEFAULT_PUBLISH_GITHUB_BRANCH = "main"
+DEFAULT_PUBLISH_GITHUB_DIR = "meeting"
 
 T = TypeVar("T")
 
@@ -106,6 +109,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-copy",
         action="store_true",
         help="Do not copy the final Markdown file to the Obsidian/iCloud folder.",
+    )
+    common.add_argument(
+        "--publish-github-repo",
+        default=DEFAULT_PUBLISH_GITHUB_REPO,
+        help=(
+            "Git repository to push the final Markdown file to. "
+            f"Default: {DEFAULT_PUBLISH_GITHUB_REPO}"
+        ),
+    )
+    common.add_argument(
+        "--publish-github-branch",
+        default=DEFAULT_PUBLISH_GITHUB_BRANCH,
+        help=(
+            "Branch to push the final Markdown file to. "
+            f"Default: {DEFAULT_PUBLISH_GITHUB_BRANCH}"
+        ),
+    )
+    common.add_argument(
+        "--publish-github-dir",
+        default=DEFAULT_PUBLISH_GITHUB_DIR,
+        help=(
+            "Directory in the publish repository for the final Markdown file. "
+            f"Default: {DEFAULT_PUBLISH_GITHUB_DIR}"
+        ),
+    )
+    common.add_argument(
+        "--publish-checkout",
+        type=Path,
+        help="Local checkout path used for GitHub publishing.",
+    )
+    common.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="Do not push the final Markdown file to GitHub.",
     )
 
     subparsers.add_parser(
@@ -816,6 +853,142 @@ def copy_markdown_output(output_path: Path, copy_to_dir: Path | None) -> Path | 
     return destination_path
 
 
+def publish_markdown_to_git(
+    output_path: Path,
+    repo_url: str,
+    branch: str,
+    publish_dir: str,
+    checkout_path: Path | None,
+) -> Path:
+    repo_url = repo_url.strip()
+    branch = branch.strip()
+    if not repo_url:
+        raise MeetingSummaryError("--publish-github-repo must not be empty.")
+    if not branch:
+        raise MeetingSummaryError("--publish-github-branch must not be empty.")
+
+    relative_publish_dir = validate_publish_dir(publish_dir)
+    checkout = resolve_publish_checkout(repo_url, checkout_path)
+    ensure_publish_checkout(repo_url, branch, checkout)
+
+    destination_dir = checkout / relative_publish_dir
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination_path = destination_dir / output_path.name
+    shutil.copy2(output_path, destination_path)
+    log(
+        "Markdown staged for GitHub publish: "
+        f"{destination_path} ({format_bytes(destination_path.stat().st_size)})"
+    )
+
+    relative_destination = destination_path.relative_to(checkout).as_posix()
+    status = run_git(["status", "--short", "--", relative_destination], checkout, "status")
+    if not status.strip():
+        log(f"GitHub publish skipped; no changes for {relative_destination}.")
+        return destination_path
+
+    run_git(["add", "--", relative_destination], checkout, "add")
+    run_git(
+        ["commit", "-m", f"Add meeting summary {output_path.name}"],
+        checkout,
+        "commit",
+    )
+    try:
+        run_git(["push", "origin", branch], checkout, "push")
+    except MeetingSummaryError:
+        log("GitHub push failed; pulling with rebase once before retrying.")
+        run_git(["pull", "--rebase", "origin", branch], checkout, "pull --rebase")
+        run_git(["push", "origin", branch], checkout, "push")
+
+    log(f"Markdown pushed to {repo_url} {branch}:{relative_destination}")
+    return destination_path
+
+
+def validate_publish_dir(publish_dir: str) -> Path:
+    value = publish_dir.strip()
+    if not value:
+        raise MeetingSummaryError("--publish-github-dir must not be empty.")
+
+    path = Path(value)
+    if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+        raise MeetingSummaryError(
+            "--publish-github-dir must be a relative path inside the publish repo."
+        )
+    return path
+
+
+def resolve_publish_checkout(repo_url: str, checkout_path: Path | None) -> Path:
+    if checkout_path is not None:
+        return checkout_path.expanduser().resolve()
+
+    base_dir = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if base_dir:
+        cache_dir = Path(base_dir)
+    else:
+        cache_dir = Path.home() / ".cache"
+
+    repo_slug = sanitize_filename(repo_url.removesuffix(".git"))
+    return (cache_dir / "meeting_summary" / "publish" / repo_slug).resolve()
+
+
+def ensure_publish_checkout(repo_url: str, branch: str, checkout: Path) -> None:
+    if shutil.which("git") is None:
+        raise MeetingSummaryError("git was not found on PATH.")
+
+    git_dir = checkout / ".git"
+    if git_dir.exists():
+        current_origin = run_git(["remote", "get-url", "origin"], checkout, "remote check")
+        if current_origin.strip() != repo_url:
+            raise MeetingSummaryError(
+                f"Publish checkout {checkout} uses origin {current_origin}, "
+                f"expected {repo_url}."
+            )
+        run_git(["fetch", "origin", branch], checkout, "fetch")
+        run_git(["checkout", branch], checkout, "checkout")
+        run_git(["pull", "--ff-only", "origin", branch], checkout, "pull")
+        return
+
+    if checkout.exists() and any(checkout.iterdir()):
+        raise MeetingSummaryError(
+            f"Publish checkout path exists but is not a git checkout: {checkout}"
+        )
+
+    checkout.parent.mkdir(parents=True, exist_ok=True)
+    run_git(
+        [
+            "clone",
+            "--branch",
+            branch,
+            "--single-branch",
+            repo_url,
+            str(checkout),
+        ],
+        None,
+        "clone",
+    )
+
+
+def run_git(args: Sequence[str], cwd: Path | None, label: str) -> str:
+    log(f"Running git {label}...")
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd) if cwd is not None else None,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise MeetingSummaryError("git was not found on PATH.") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        if not detail:
+            detail = f"exit code {exc.returncode}"
+        raise MeetingSummaryError(f"git {label} failed: {detail}") from exc
+    return completed.stdout.strip()
+
+
 def read_cached_response(
     cache_dir: Path | None,
     model: str,
@@ -1035,6 +1208,16 @@ def run(args: argparse.Namespace) -> Path:
         log("Markdown copy disabled by --no-copy.")
     else:
         copy_markdown_output(output_path, args.copy_to)
+    if args.no_publish:
+        log("GitHub publish disabled by --no-publish.")
+    else:
+        publish_markdown_to_git(
+            output_path,
+            args.publish_github_repo,
+            args.publish_github_branch,
+            args.publish_github_dir,
+            args.publish_checkout,
+        )
     return output_path
 
 
