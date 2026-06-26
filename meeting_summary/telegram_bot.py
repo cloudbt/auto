@@ -25,6 +25,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = SCRIPT_DIR / "telegram_downloads"
 LOG_PATH = SCRIPT_DIR / "telegram_bot.log"
 VALID_MODES = {"meeting", "transcript", "compact"}
+SUBPROCESS_TIMEOUT_SECONDS = 1800  # Backstop so the bot never hangs forever.
 
 
 logging.basicConfig(
@@ -208,16 +209,38 @@ def run_meeting_summary(mode: str, input_path: Path) -> Path:
         str(input_path),
     ]
     logger.info("Running: %s", " ".join(command))
-    completed = subprocess.run(
-        command,
-        cwd=SCRIPT_DIR.parent,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    # Force UTF-8 stdio so non-ASCII output paths (e.g. Japanese filenames)
+    # survive the round-trip and parse_output_path can match the real file.
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=SCRIPT_DIR.parent,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Processing timed out after {SUBPROCESS_TIMEOUT_SECONDS // 60} minutes; "
+            "aborted."
+        ) from exc
     stdout = completed.stdout.strip()
     stderr = completed.stderr.strip()
+    # Record the full pipeline detail for every job (success or failure), so the
+    # bot log is no longer just "Running..." / "output".
+    logger.info(
+        "main.py finished for %s (exit %s).\n--- stderr ---\n%s\n--- stdout ---\n%s",
+        input_path.name,
+        completed.returncode,
+        stderr or "(empty)",
+        stdout or "(empty)",
+    )
     if completed.returncode != 0:
         detail = "\n".join(part for part in (stderr, stdout) if part)
         raise RuntimeError(detail or f"meeting_summary exited with {completed.returncode}")

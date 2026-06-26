@@ -14,11 +14,15 @@ from pathlib import Path
 from typing import Callable, Sequence, TypeVar
 
 
-DEFAULT_MODEL = "gemini-3.5-flash"
+DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash"
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CHUNK_MINUTES = 20.0
+LOG_FILE = SCRIPT_DIR / "meeting_summary.log"
+DEFAULT_CHUNK_MINUTES = 25.0
 DEFAULT_MAX_HOURS = 2.0
 DEFAULT_MAX_OUTPUT_TOKENS = 65536
+GENERATION_TEMPERATURE = 0.3
+REQUEST_TIMEOUT_MS = 180_000
 MEDIA_CACHE_VERSION = "v1-mono16k-64k"
 DEFAULT_COPY_OUTPUT_DIR = Path(
     r"C:\Users\whz\iCloudDrive\iCloud~md~obsidian\work\work\MeetingSummary"
@@ -32,6 +36,10 @@ T = TypeVar("T")
 
 class MeetingSummaryError(Exception):
     """Raised for expected user-facing failures."""
+
+
+class EmptyResponseError(Exception):
+    """Gemini returned no usable text (e.g. finishReason=MALFORMED_RESPONSE)."""
 
 
 @dataclass(frozen=True)
@@ -77,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--chunk-minutes",
         type=float,
         default=DEFAULT_CHUNK_MINUTES,
-        help="Audio chunk size in minutes. Default: 20.",
+        help=f"Audio chunk size in minutes. Default: {DEFAULT_CHUNK_MINUTES:g}.",
     )
     common.add_argument(
         "--max-output-tokens",
@@ -213,6 +221,16 @@ def resolve_model(cli_model: str | None) -> str:
     )
 
 
+def resolve_fallback_model(model: str) -> str | None:
+    fallback = (
+        os.environ.get("GEMINI_FALLBACK_MODEL", "").strip()
+        or DEFAULT_FALLBACK_MODEL
+    )
+    if not fallback or fallback == model:
+        return None
+    return fallback
+
+
 def require_media_tools() -> None:
     missing = [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
     if missing:
@@ -246,7 +264,16 @@ def run_tool(args: Sequence[str], label: str) -> str:
 
 def log(message: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {message}", file=sys.stderr)
+    line = f"[{timestamp}] [pid {os.getpid()}] {message}"
+    print(line, file=sys.stderr)
+    # Also append to a persistent file so the full pipeline is inspectable in
+    # real time (tail -f) and after the fact, success or failure. Best-effort:
+    # never let a logging hiccup abort the job.
+    try:
+        with LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
 
 
 def format_bytes(size: int) -> str:
@@ -430,12 +457,16 @@ def make_client(api_key: str):
             "python -m pip install -r meeting_summary/requirements.txt"
         ) from exc
     log("Gemini client initialized.")
-    return genai.Client(api_key=api_key), types
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+    )
+    return client, types
 
 
 def generation_config(types, max_output_tokens: int):
     return types.GenerateContentConfig(
-        temperature=0.1,
+        temperature=GENERATION_TEMPERATURE,
         max_output_tokens=max_output_tokens,
     )
 
@@ -492,11 +523,36 @@ def wait_until_active(client, file_obj, timeout_seconds: int = 300):
         current = client.files.get(name=current.name)
 
 
-def response_text(response) -> str:
-    text = getattr(response, "text", None)
+def finish_reason_label(response) -> str | None:
+    candidates = getattr(response, "candidates", None)
+    if not candidates:
+        return None
+    reason = getattr(candidates[0], "finish_reason", None)
+    if reason is None:
+        return None
+    return getattr(reason, "name", None) or str(reason)
+
+
+GOOD_FINISH_REASONS = {"STOP", "FINISH_REASON_UNSPECIFIED"}
+
+
+def extract_response_text(response) -> str:
+    reason = finish_reason_label(response)
+    try:
+        text = getattr(response, "text", None)
+    except Exception:  # SDK may raise when the candidate carries no text parts.
+        text = None
+    # A non-STOP reason means the output was truncated/degenerate (e.g.
+    # MAX_TOKENS repeat-loop) or malformed, even when some text came back.
+    if reason and reason.upper() not in GOOD_FINISH_REASONS:
+        raise EmptyResponseError(
+            f"Gemini stopped with finishReason={reason} "
+            "(truncated or degenerate output)."
+        )
     if text and text.strip():
         return strip_outer_fence(text.strip())
-    raise MeetingSummaryError("Gemini returned an empty response.")
+    detail = f" (finishReason={reason})" if reason else ""
+    raise EmptyResponseError(f"Gemini returned an empty response{detail}.")
 
 
 def strip_outer_fence(text: str) -> str:
@@ -507,6 +563,74 @@ def strip_outer_fence(text: str) -> str:
     if len(lines) >= 3:
         return "\n".join(lines[1:-1]).strip()
     return stripped
+
+
+def should_failover_fast(exc: Exception) -> bool:
+    """Transient capacity / hang errors where retrying the same model is futile,
+    so we switch to the fallback model immediately instead of burning retries."""
+    text = str(exc).upper()
+    markers = (
+        "503",
+        "UNAVAILABLE",
+        "429",
+        "RESOURCE_EXHAUSTED",
+        "OVERLOADED",
+        "TIMEOUT",
+        "DEADLINE",
+    )
+    return any(marker in text for marker in markers)
+
+
+def generate_text(client, model: str, contents, config, retries: int) -> str:
+    models_to_try = [model]
+    fallback = resolve_fallback_model(model)
+    if fallback is not None:
+        models_to_try.append(fallback)
+    attempts = max(1, retries)
+
+    last_error: Exception | None = None
+    for index, current_model in enumerate(models_to_try):
+        has_next_model = index < len(models_to_try) - 1
+        if index > 0:
+            log(
+                f"Falling back to model {current_model} after "
+                f"model {models_to_try[index - 1]} failed."
+            )
+        for attempt in range(1, attempts + 1):
+            try:
+                log(
+                    f"Gemini content generation ({current_model}): "
+                    f"attempt {attempt}/{attempts}."
+                )
+                response = client.models.generate_content(
+                    model=current_model,
+                    contents=contents,
+                    config=config,
+                )
+                return extract_response_text(response)
+            except Exception as exc:  # SDK exceptions vary by transport.
+                last_error = exc
+                # An overloaded/unresponsive model won't recover by retrying it;
+                # jump straight to the fallback model if one is left.
+                if has_next_model and should_failover_fast(exc):
+                    log(
+                        f"{current_model} is overloaded/unresponsive ({exc}); "
+                        "switching to fallback model now."
+                    )
+                    break
+                if attempt == attempts:
+                    break
+                delay = min(2 ** (attempt - 1), 8)
+                log(
+                    f"Gemini content generation ({current_model}) failed on "
+                    f"attempt {attempt}/{attempts}; retrying in {delay}s... ({exc})"
+                )
+                time.sleep(delay)
+
+    raise MeetingSummaryError(
+        f"Gemini content generation failed for model(s) "
+        f"{', '.join(models_to_try)}: {last_error}"
+    )
 
 
 def generate_from_file(
@@ -532,16 +656,7 @@ def generate_from_file(
         uploaded = wait_until_active(client, uploaded)
         config = generation_config(types, max_output_tokens)
         log(f"Generating content with model {model} from uploaded chunk...")
-        response = retry(
-            lambda: client.models.generate_content(
-                model=model,
-                contents=[prompt, uploaded],
-                config=config,
-            ),
-            "Gemini content generation",
-            retries,
-        )
-        text = response_text(response)
+        text = generate_text(client, model, [prompt, uploaded], config, retries)
         log(f"Gemini returned {len(text):,} character(s) for chunk file.")
         return text
     finally:
@@ -568,16 +683,7 @@ def generate_from_text(
         f"Generating content with model {model} from text prompt "
         f"({len(prompt):,} character(s))..."
     )
-    response = retry(
-        lambda: client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=config,
-        ),
-        "Gemini content generation",
-        retries,
-    )
-    text = response_text(response)
+    text = generate_text(client, model, prompt, config, retries)
     log(f"Gemini returned {len(text):,} character(s) from text prompt.")
     return text
 
