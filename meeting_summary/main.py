@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -203,14 +204,42 @@ def load_local_env() -> None:
         os.environ.setdefault(key, value)
 
 
-def resolve_api_key() -> str:
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
+def resolve_api_keys() -> list[str]:
+    """Collect every configured Gemini API key, in priority order.
+
+    Supports a single ``GEMINI_API_KEY`` as well as numbered variants
+    (``GEMINI_API_KEY1``, ``GEMINI_API_KEY2``, ...). The unnumbered key is
+    tried first, then numbered keys in ascending order. Duplicates and blanks
+    are dropped. Multiple keys let us fail over when one hits a rate/quota
+    limit.
+    """
+    pattern = re.compile(r"^GEMINI_API_KEY(\d*)$")
+    found: list[tuple[int, str]] = []
+    for name, value in os.environ.items():
+        match = pattern.match(name)
+        if match is None:
+            continue
+        key = value.strip()
+        if not key:
+            continue
+        order = int(match.group(1)) if match.group(1) else 0
+        found.append((order, key))
+    found.sort(key=lambda item: item[0])
+
+    keys: list[str] = []
+    seen: set[str] = set()
+    for _, key in found:
+        if key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    if not keys:
         raise MeetingSummaryError(
-            "GEMINI_API_KEY is not set. Create meeting_summary/.env from "
-            ".env.example or set the environment variable."
+            "No Gemini API key is set. Create meeting_summary/.env from "
+            ".env.example or set GEMINI_API_KEY (or GEMINI_API_KEY1, "
+            "GEMINI_API_KEY2, ...)."
         )
-    return api_key
+    return keys
 
 
 def resolve_model(cli_model: str | None) -> str:
@@ -464,6 +493,61 @@ def make_client(api_key: str):
     return client, types
 
 
+class ClientPool:
+    """Holds several Gemini API keys and rotates to the next one when the
+    active key hits a rate/quota limit.
+
+    Attribute access (``.models``, ``.files``, ...) is proxied to the current
+    underlying google-genai client, so existing call sites can keep using this
+    object exactly like a normal client.
+    """
+
+    def __init__(self, api_keys: Sequence[str]):
+        if not api_keys:
+            raise MeetingSummaryError("ClientPool requires at least one API key.")
+        self._keys = list(api_keys)
+        self._index = 0
+        self._client = None
+        self.types = None
+        self._build()
+
+    def _build(self) -> None:
+        self._client, self.types = make_client(self._keys[self._index])
+        log(f"Using Gemini API key #{self._index + 1} of {len(self._keys)}.")
+
+    def __getattr__(self, name: str):
+        # Only reached for attributes not set on the instance (e.g. models,
+        # files); forward them to the active client.
+        return getattr(self.__dict__["_client"], name)
+
+    @property
+    def has_next_key(self) -> bool:
+        return self._index + 1 < len(self._keys)
+
+    def rotate(self) -> bool:
+        """Switch to the next API key. Returns False if none are left."""
+        if not self.has_next_key:
+            log("Rate limit hit but no more Gemini API keys to switch to.")
+            return False
+        self._index += 1
+        log(
+            f"Rate limit hit; switching to Gemini API key "
+            f"#{self._index + 1} of {len(self._keys)}."
+        )
+        self._build()
+        return True
+
+
+def is_rate_limited(exc: Exception) -> bool:
+    """True when an error reflects a per-key quota / rate limit, which is
+    recoverable by switching to a different API key."""
+    text = str(exc).upper()
+    return any(
+        marker in text
+        for marker in ("429", "RESOURCE_EXHAUSTED", "QUOTA", "RATE LIMIT")
+    )
+
+
 def generation_config(types, max_output_tokens: int):
     return types.GenerateContentConfig(
         temperature=GENERATION_TEMPERATURE,
@@ -471,15 +555,29 @@ def generation_config(types, max_output_tokens: int):
     )
 
 
-def retry(operation: Callable[[], T], description: str, attempts: int) -> T:
+def retry(
+    operation: Callable[[], T],
+    description: str,
+    attempts: int,
+    pool: "ClientPool | None" = None,
+) -> T:
     attempts = max(1, attempts)
     last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
+    attempt = 0
+    while attempt < attempts:
+        attempt += 1
         try:
             log(f"{description}: attempt {attempt}/{attempts}.")
             return operation()
         except Exception as exc:  # SDK exceptions vary by transport.
             last_error = exc
+            # On a per-key quota / rate limit, switch API keys and retry
+            # without burning an attempt; the operation closes over the pool
+            # so the next call uses the new key automatically.
+            if pool is not None and is_rate_limited(exc) and pool.rotate():
+                log(f"Retrying {description} with the next API key.")
+                attempt -= 1
+                continue
             if attempt == attempts:
                 break
             delay = min(2 ** (attempt - 1), 8)
@@ -596,7 +694,9 @@ def generate_text(client, model: str, contents, config, retries: int) -> str:
                 f"Falling back to model {current_model} after "
                 f"model {models_to_try[index - 1]} failed."
             )
-        for attempt in range(1, attempts + 1):
+        attempt = 0
+        while attempt < attempts:
+            attempt += 1
             try:
                 log(
                     f"Gemini content generation ({current_model}): "
@@ -610,6 +710,17 @@ def generate_text(client, model: str, contents, config, retries: int) -> str:
                 return extract_response_text(response)
             except Exception as exc:  # SDK exceptions vary by transport.
                 last_error = exc
+                # A per-key quota / rate limit recovers by switching API keys,
+                # not by retrying or changing models. Try the next key first,
+                # keeping the same model and without burning a retry attempt.
+                if (
+                    is_rate_limited(exc)
+                    and isinstance(client, ClientPool)
+                    and client.rotate()
+                ):
+                    log(f"Retrying model {current_model} with the next API key.")
+                    attempt -= 1
+                    continue
                 # An overloaded/unresponsive model won't recover by retrying it;
                 # jump straight to the fallback model if one is left.
                 if has_next_model and should_failover_fast(exc):
@@ -652,6 +763,7 @@ def generate_from_file(
             lambda: client.files.upload(file=str(chunk_path)),
             "Gemini file upload",
             retries,
+            pool=client if isinstance(client, ClientPool) else None,
         )
         uploaded = wait_until_active(client, uploaded)
         config = generation_config(types, max_output_tokens)
@@ -1210,7 +1322,8 @@ def run(args: argparse.Namespace) -> Path:
     log(f"Starting mode: {args.mode}")
     log(f"Input file: {input_file}")
     load_local_env()
-    api_key = resolve_api_key()
+    api_keys = resolve_api_keys()
+    log(f"Loaded {len(api_keys)} Gemini API key(s).")
     model = resolve_model(args.model)
     log(f"Model: {model}")
     require_media_tools()
@@ -1227,7 +1340,8 @@ def run(args: argparse.Namespace) -> Path:
             f"the configured limit {format_time(max_seconds)}."
         )
 
-    client, types = make_client(api_key)
+    client = ClientPool(api_keys)
+    types = client.types
 
     temp_context = None
     if args.no_cache:
