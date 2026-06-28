@@ -61,5 +61,63 @@ else {
     }
 }
 
-# 4. 打开文件
+# 4. 在桌面创建快捷方式，方便今后打开
+#    注意：不能用 WScript.Shell 的 CreateShortcut——它用系统 ANSI 代码页处理
+#    路径，在非中文系统区域设置（本机为日文）下无法表示中文文件名，会报
+#    “Value does not fall within the expected range.”。这里改用 Unicode 版的
+#    IShellLink / IPersistFile 接口，可正确处理中文路径。
+if (-not ('ShellLinkHelper.Lnk' -as [type])) {
+    Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Text;
+namespace ShellLinkHelper {
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+    internal class ShellLink { }
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown),
+     Guid("000214F9-0000-0000-C000-000000000046")]
+    internal interface IShellLinkW {
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder f, int c, IntPtr p, int fl);
+        void GetIDList(out IntPtr ppidl);
+        void SetIDList(IntPtr pidl);
+        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder n, int c);
+        void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string n);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder d, int c);
+        void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string d);
+        void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder a, int c);
+        void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string a);
+        void GetHotkey(out short w);
+        void SetHotkey(short w);
+        void GetShowCmd(out int c);
+        void SetShowCmd(int c);
+        void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder p, int c, out int i);
+        void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string p, int i);
+        void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string p, int r);
+        void Resolve(IntPtr h, int fl);
+        void SetPath([MarshalAs(UnmanagedType.LPWStr)] string f);
+    }
+    public static class Lnk {
+        public static void Create(string lnkPath, string target, string workDir, string desc) {
+            IShellLinkW link = (IShellLinkW)new ShellLink();
+            link.SetPath(target);
+            if (!string.IsNullOrEmpty(workDir)) link.SetWorkingDirectory(workDir);
+            if (!string.IsNullOrEmpty(desc)) link.SetDescription(desc);
+            ((IPersistFile)link).Save(lnkPath, false);
+        }
+    }
+}
+'@
+}
+$desktop = [Environment]::GetFolderPath('Desktop')
+$shortcutPath = Join-Path -Path $desktop -ChildPath ([System.IO.Path]::GetFileNameWithoutExtension($fullPath) + '.lnk')
+[ShellLinkHelper.Lnk]::Create(
+    $shortcutPath,
+    $fullPath,
+    [System.IO.Path]::GetDirectoryName($fullPath),
+    "打开 $([System.IO.Path]::GetFileName($fullPath))"
+)
+Write-Host "已在桌面创建快捷方式: $shortcutPath"
+
+# 5. 打开文件
 Invoke-Item -LiteralPath $fullPath
