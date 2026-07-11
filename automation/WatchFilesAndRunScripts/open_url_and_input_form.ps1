@@ -1,3 +1,9 @@
+# 读取这个 file 的值，是一个，只有一行。
+$ITPMValue = Get-Content "C:\\Users\\whz\\Desktop\\ITPM.txt"
+
+# 输出到屏幕里头
+Write-Host "ITPM Value: $ITPMValue"
+
 $url = "https://www.library.city.kita.lg.jp/opw/OPW/OPWUSERCONF.CSP"
 Start-Process "msedge.exe" $url
 $Username = "xxx"
@@ -45,6 +51,11 @@ $wshell = New-Object -ComObject wscript.shell
 # $wshell.SendKeys("{TAB}")
 # Start-Sleep -Seconds 1
 # $wshell.SendKeys($Password)
+
+# 按Win + ↑（上方向键）：将当前窗口最大化。
+Start-Sleep -Seconds 1
+$wshell.SendKeys("^{UP}")
+# Login to the website
 Start-Sleep -Seconds 1
 $wshell.SendKeys("{ENTER}")
 
@@ -56,8 +67,19 @@ $wshell.SendKeys("{ENTER}")
 # # Windows11 Ctrl + Aで選択する
 # $wshell.SendKeys("^(a)")
 
-# 鼠标点击指定的屏幕坐标位置
+# 打开主主页面。
 Invoke-MouseClick -X $ClickX -Y $ClickY
+Start-Sleep -Seconds 2
+
+# 打开简易检索。
+Invoke-MouseClick -X 302 -Y 262
+Start-Sleep -Seconds 2
+Invoke-MouseClick -X 611 -Y 529
+Start-Sleep -Seconds 2
+$wshell.SendKeys($ITPMValue)
+Start-Sleep -Seconds 2
+
+$wshell.SendKeys("{ENTER}")
 
 # $TodayText = Get-Date -Format "MMdd"
 # $ClipboardText = "Init$TodayText#Osei"
