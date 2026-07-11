@@ -47,9 +47,18 @@ $wshell = New-Object -ComObject wscript.shell
 # $wshell.SendKeys($Password)
 Start-Sleep -Seconds 1
 $wshell.SendKeys("{ENTER}")
+
+# # Windows11 Ctrl + Vでクリップボードの内容を貼り付ける
+# $wshell.SendKeys("^(v)")
+
+# # Windows11 Ctrl + Sで保存する
+# $wshell.SendKeys("^(s)")
+# # Windows11 Ctrl + Aで選択する
+# $wshell.SendKeys("^(a)")
+
 # 鼠标点击指定的屏幕坐标位置
 Invoke-MouseClick -X $ClickX -Y $ClickY
 
-$TodayText = Get-Date -Format "MMdd"
-$ClipboardText = "Init$TodayText#Osei"
-Set-Clipboard -Value $ClipboardText
+# $TodayText = Get-Date -Format "MMdd"
+# $ClipboardText = "Init$TodayText#Osei"
+# Set-Clipboard -Value $ClipboardText

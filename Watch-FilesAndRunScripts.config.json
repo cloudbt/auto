@@ -1,0 +1,32 @@
+{
+  "WatchJobs": [
+    {
+      "Name": "ITPM.txt",
+      "Enabled": true,
+      "FilePath": "C:\\Users\\whz\\Desktop\\ITPM.txt",
+      "ScriptPath": "C:\\work\\work-git\\git\\auto\\open_url_and_input_form.ps1",
+      "CheckMode": "Metadata"
+    },
+    {
+      "Name": "SAP.txt",
+      "Enabled": true,
+      "FilePath": "C:\\Users\\whz\\Desktop\\SAP.txt",
+      "ScriptPath": "C:\\work\\work-git\\git\\auto\\position.ps1",
+      "CheckMode": "ContentHash"
+    },
+    {
+      "Name": "File C",
+      "Enabled": false,
+      "FilePath": "C:\\path\\to\\FileC",
+      "ScriptPath": "C:\\path\\to\\ScriptC.ps1",
+      "CheckMode": "ContentHash"
+    },
+    {
+      "Name": "File D",
+      "Enabled": false,
+      "FilePath": "C:\\path\\to\\FileD",
+      "ScriptPath": "C:\\path\\to\\ScriptD.ps1",
+      "CheckMode": "Metadata"
+    }
+  ]
+}
