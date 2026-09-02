@@ -50,6 +50,14 @@ try {
     Write-Log ("运行身份：{0}  管理员={1}  PS版本={2}" -f $env:USERNAME, $isAdmin, $PSVersionTable.PSVersion)
 } catch {}
 
+# ---------------------------------------------------------------- 邮件文件夹监视
+# 后台启动：邮件文件夹出现新 txt -> 自动执行 open_edge_urls.ps1（不受 7-10 窗口限制）
+try {
+    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\work\work-git\git\auto\automation\WatchFilesAndRunScripts\Watch-MailFolderAndOpenUrls.ps1'
+    Write-Log "已后台启动邮件文件夹监视 Watch-MailFolderAndOpenUrls.ps1。"
+}
+catch { Write-Log "启动邮件文件夹监视失败: $($_.Exception.Message)" 'ERROR' }
+
 # ---------------------------------------------------------------- 时间窗口判断
 if (-not $IgnoreTimeWindow) {
     $now   = Get-Date
