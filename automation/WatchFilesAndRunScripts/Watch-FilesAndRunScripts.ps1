@@ -1,7 +1,7 @@
 param(
-    [string]$ConfigPath = "C:\work\work-git\git\auto\Watch-FilesAndRunScripts.config.json",
+    [string]$ConfigPath = "C:\work\work-git\git\auto\automation\WatchFilesAndRunScripts\Watch-FilesAndRunScripts.config.json",
     [int]$IntervalSeconds = 120,
-    [string]$LogPath = "C:\work\work-git\git\auto\WatchFilesAndRunScripts\Watch-FilesAndRunScripts.log"
+    [string]$LogPath = "C:\work\work-git\git\auto\automation\WatchFilesAndRunScripts\Watch-FilesAndRunScripts.log"
 )
 
 $ErrorActionPreference = "Stop"
