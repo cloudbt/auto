@@ -222,3 +222,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Credentials - plain-text passwords, never commit
+pw.txt
+*.pw
+credentials.txt

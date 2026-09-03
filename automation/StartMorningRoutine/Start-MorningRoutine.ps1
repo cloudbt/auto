@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     早上开机例程：在 7:00-10:00 这个时间段内登录时，自动
       1. 打开 Edge 收藏夹分组 "test" 里的所有链接
@@ -23,7 +23,7 @@ param(
     [string]$BookmarkFolder     = 'test',
     [string]$WindowsAppId       = 'MicrosoftCorporationII.Windows365_8wekyb3d8bbwe!Windows365',
     [string]$PcName             = 'mini-pc',
-    [string]$PasswordFile       = "$PSScriptRoot\pw.txt",
+    [string]$PasswordFile       = "C:\work\work-git\git\auto\automation\StartMorningRoutine\pw.txt",
     [int]   $StartupDelaySeconds= 15,
     [int]   $WaitForAppSeconds  = 60,
     [int]   $WaitForCredSeconds = 240,
@@ -52,11 +52,11 @@ try {
 
 # ---------------------------------------------------------------- 邮件文件夹监视
 # 后台启动：邮件文件夹出现新 txt -> 自动执行 open_edge_urls.ps1（不受 7-10 窗口限制）
-try {
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\work\work-git\git\auto\automation\WatchFilesAndRunScripts\Watch-MailFolderAndOpenUrls.ps1'
-    Write-Log "已后台启动邮件文件夹监视 Watch-MailFolderAndOpenUrls.ps1。"
-}
-catch { Write-Log "启动邮件文件夹监视失败: $($_.Exception.Message)" 'ERROR' }
+# try {
+#     Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\work\work-git\git\auto\automation\WatchFilesAndRunScripts\Watch-MailFolderAndOpenUrls.ps1'
+#     Write-Log "已后台启动邮件文件夹监视 Watch-MailFolderAndOpenUrls.ps1。"
+# }
+# catch { Write-Log "启动邮件文件夹监视失败: $($_.Exception.Message)" 'ERROR' }
 
 # ---------------------------------------------------------------- 时间窗口判断
 if (-not $IgnoreTimeWindow) {
@@ -142,252 +142,161 @@ else {
 # 3) Windows App -> 连接 PC -> 输入密码
 # ================================================================
 function Connect-RemotePc {
-    param([string]$AppId, [string]$Tile, [string]$PwFile, [int]$AppTimeout, [int]$CredTimeout)
+    param([string]$AppId, [string]$Tile, [string]$PwFile, [int]$AppTimeout, [int]$CredTimeout, [int]$TileTimeout = 30)
+
+    # 凭据对话框受 UIPI 保护：非提权进程的 SendInput 会返回成功、但按键被静默丢弃。
+    if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Log "当前非管理员，凭据窗口的按键会被 UIPI 丢弃，密码无法自动输入。请把计划任务注册为最高权限（Register-MorningTask.ps1 -Elevated）。" 'WARN'
+    }
 
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
-    Add-Type -AssemblyName System.Windows.Forms
-    if (-not ('Win32Mouse' -as [type])) {
+    if (-not ('W' -as [type])) {
     Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class Win32Mouse {
-    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-    [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, IntPtr e);
-    const uint DOWN = 0x0002, UP = 0x0004;
-    public static void DoubleClick(int x, int y){
-        SetCursorPos(x,y);
-        mouse_event(DOWN,0,0,0,IntPtr.Zero); mouse_event(UP,0,0,0,IntPtr.Zero);
-        System.Threading.Thread.Sleep(90);
-        mouse_event(DOWN,0,0,0,IntPtr.Zero); mouse_event(UP,0,0,0,IntPtr.Zero);
-    }
-}
-"@
-    }
-
-    if (-not ('NativeWin' -as [type])) {
-    Add-Type @"
-using System;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class NativeWin {
-    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+using System; using System.Threading; using System.Runtime.InteropServices;
+public class W {
+    [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] static extern void mouse_event(uint f, uint dx, uint dy, uint d, IntPtr e);
+    [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] p, int cb);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr p);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool f);
     [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int n);
-    [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint n, INPUT[] p, int cb);
-    [DllImport("user32.dll")] static extern short VkKeyScan(char ch);
-    [DllImport("user32.dll")] static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
 
-    [StructLayout(LayoutKind.Sequential)] struct INPUT { public int type; public InputUnion u; }
-    [StructLayout(LayoutKind.Explicit)] struct InputUnion {
+    [StructLayout(LayoutKind.Sequential)] struct INPUT { public int type; public U u; }
+    [StructLayout(LayoutKind.Explicit)] struct U {
         [FieldOffset(0)] public MOUSEINPUT mi;
         [FieldOffset(0)] public KEYBDINPUT ki;
         [FieldOffset(0)] public HARDWAREINPUT hi;
     }
-    [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT { public int dx; public int dy; public uint d; public uint f; public uint t; public IntPtr ex; }
-    [StructLayout(LayoutKind.Sequential)] struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [StructLayout(LayoutKind.Sequential)] struct HARDWAREINPUT { public uint msg; public ushort l; public ushort h; }
+    [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT { public int dx, dy; public uint d, f, t; public IntPtr ex; }
+    [StructLayout(LayoutKind.Sequential)] struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public IntPtr ex; }
+    [StructLayout(LayoutKind.Sequential)] struct HARDWAREINPUT { public uint msg; public ushort l, h; }
+    const uint KEYBOARD = 1, KEYUP = 0x0002, UNICODE = 0x0004;
 
-    const uint INPUT_KEYBOARD = 1, KEYUP = 0x0002, UNICODE = 0x0004;
-
-    public static IntPtr Foreground(){ return GetForegroundWindow(); }
-    public static void ForceForeground(IntPtr h){
-        IntPtr fg = GetForegroundWindow();
-        uint fgT = GetWindowThreadProcessId(fg, IntPtr.Zero);
-        uint myT = GetCurrentThreadId();
-        AttachThreadInput(myT, fgT, true);
+    static void Key(ushort vk, ushort scan, uint flags) {
+        INPUT[] i = new INPUT[1];
+        i[0].type = (int)KEYBOARD;
+        i[0].u.ki.wVk = vk; i[0].u.ki.wScan = scan; i[0].u.ki.dwFlags = flags;
+        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
+    }
+    // 把窗口强行拉到前台：借用当前前台线程的输入队列，绕过前台锁定
+    public static void Foreground(IntPtr h) {
+        uint fg = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero), me = GetCurrentThreadId();
+        AttachThreadInput(me, fg, true);
         ShowWindow(h, 5); BringWindowToTop(h); SetForegroundWindow(h);
-        AttachThreadInput(myT, fgT, false);
+        AttachThreadInput(me, fg, false);
     }
-    static void Send(ushort vk, ushort scan, uint flags){
-        INPUT[] inp = new INPUT[1];
-        inp[0].type = (int)INPUT_KEYBOARD;
-        inp[0].u.ki.wVk = vk; inp[0].u.ki.wScan = scan; inp[0].u.ki.dwFlags = flags;
-        SendInput(1, inp, Marshal.SizeOf(typeof(INPUT)));
+    public static void Click(int x, int y) {
+        SetCursorPos(x, y); Thread.Sleep(120);
+        mouse_event(0x0002, 0, 0, 0, IntPtr.Zero); mouse_event(0x0004, 0, 0, 0, IntPtr.Zero);
     }
-    public static void TypeString(string s){
-        foreach(char c in s){
-            Send(0, (ushort)c, UNICODE);
-            Send(0, (ushort)c, UNICODE | KEYUP);
-            Thread.Sleep(15);
-        }
+    public static void DoubleClick(int x, int y) {
+        Click(x, y); Thread.Sleep(90);
+        mouse_event(0x0002, 0, 0, 0, IntPtr.Zero); mouse_event(0x0004, 0, 0, 0, IntPtr.Zero);
     }
-    // 逐键模拟真实键盘：算出虚拟键 + Shift/Ctrl/Alt 组合键，依次按下/抬起
-    public static void TypeKeys(string s){
-        const byte VK_SHIFT=0x10, VK_CONTROL=0x11, VK_MENU=0x12;
-        foreach(char c in s){
-            short vks = VkKeyScan(c);
-            if (vks == -1){
-                // 当前键盘布局打不出的字符，回退到 Unicode 注入
-                Send(0, (ushort)c, UNICODE);
-                Send(0, (ushort)c, UNICODE | KEYUP);
-                Thread.Sleep(20);
-                continue;
-            }
-            byte vk = (byte)(vks & 0xFF);
-            int sh = (vks >> 8) & 0xFF;
-            bool shift = (sh & 1)!=0, ctrl = (sh & 2)!=0, alt = (sh & 4)!=0;
-            if (shift) keybd_event(VK_SHIFT,0,0,UIntPtr.Zero);
-            if (ctrl)  keybd_event(VK_CONTROL,0,0,UIntPtr.Zero);
-            if (alt)   keybd_event(VK_MENU,0,0,UIntPtr.Zero);
-            keybd_event(vk,0,0,UIntPtr.Zero);
-            keybd_event(vk,0,KEYUP,UIntPtr.Zero);
-            if (alt)   keybd_event(VK_MENU,0,KEYUP,UIntPtr.Zero);
-            if (ctrl)  keybd_event(VK_CONTROL,0,KEYUP,UIntPtr.Zero);
-            if (shift) keybd_event(VK_SHIFT,0,KEYUP,UIntPtr.Zero);
-            Thread.Sleep(20);
-        }
+    public static void Type(string s) {
+        foreach (char c in s) { Key(0, (ushort)c, UNICODE); Key(0, (ushort)c, UNICODE | KEYUP); Thread.Sleep(25); }
     }
-    public static void PressEnter(){
-        Send(0x0D, 0, 0); Send(0x0D, 0, KEYUP);
-    }
+    public static void Enter() { Key(0x0D, 0, 0); Key(0x0D, 0, KEYUP); }
+    public static void Back(int n) { for (int i = 0; i < n; i++) { Key(0x08, 0, 0); Key(0x08, 0, KEYUP); } }
 }
 "@
     }
 
-    $AE = [System.Windows.Automation.AutomationElement]
+    $AE   = [System.Windows.Automation.AutomationElement]
+    $Tree = [System.Windows.Automation.TreeScope]
     $root = $AE::RootElement
 
-    # --- 启动 Windows App ---
-    Write-Log "启动 Windows App…"
-    Start-Process "explorer.exe" "shell:AppsFolder\$AppId"
+    # 在超时内轮询查找满足 $Match 的顶层窗口
+    function Find-TopWindow([scriptblock]$Match, [int]$Timeout) {
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            $AE::ControlTypeProperty, [System.Windows.Automation.ControlType]::Window)
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt $Timeout) {
+            foreach ($w in $root.FindAll($Tree::Children, $cond)) {
+                if (& $Match $w) { return $w }
+            }
+            Start-Sleep -Seconds 2
+        }
+        return $null
+    }
 
-    # --- 等待主窗口出现 ---
-    $appWin = $null
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    while ($sw.Elapsed.TotalSeconds -lt $AppTimeout -and -not $appWin) {
-        Start-Sleep -Seconds 2
-        $wins = $root.FindAll([System.Windows.Automation.TreeScope]::Children,
-                 (New-Object System.Windows.Automation.PropertyCondition(
-                    $AE::ControlTypeProperty, [System.Windows.Automation.ControlType]::Window)))
-        foreach ($w in $wins) {
-            if ($w.Current.Name -like '*Windows App*') { $appWin = $w; break }
+    # 元素的可点击坐标（拿不到就用外框中心）
+    function Get-Point($el) {
+        try { return $el.GetClickablePoint() } catch {
+            $r = $el.Current.BoundingRectangle
+            return New-Object System.Windows.Point(($r.X + $r.Width / 2), ($r.Y + $r.Height / 2))
         }
     }
-    if (-not $appWin) { Write-Log "没等到 Windows App 主窗口。" 'WARN'; return }
-    Write-Log "Windows App 窗口已就绪。"
-    try { [void]$appWin.SetFocus() } catch {}
+
+    # 先读密码，免得白等
+    if (-not (Test-Path -LiteralPath $PwFile)) { throw "找不到密码文件 $PwFile" }
+    $pw = Get-Content -LiteralPath $PwFile -TotalCount 1 -Encoding UTF8
+    if ([string]::IsNullOrWhiteSpace($pw)) { throw "密码文件为空: $PwFile" }
+    $pw = $pw.Trim()
+
+    Write-Log "启动 Windows App…"
+    Start-Process 'explorer.exe' "shell:AppsFolder\$AppId"
+
+    $app = Find-TopWindow { param($w) $w.Current.Name -like '*Windows App*' } $AppTimeout
+    if (-not $app) { throw "没等到 Windows App 主窗口" }
+    Write-Log "Windows App 已就绪"
+    [W]::Foreground([IntPtr]$app.Current.NativeWindowHandle)
     Start-Sleep -Seconds 3
 
-    # --- 找到 PC 磁贴 ---
+    # 找 PC 磁贴
     $tileEl = $null
-    $sw.Restart()
-    while ($sw.Elapsed.TotalSeconds -lt 30 -and -not $tileEl) {
-        $all = $appWin.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-        foreach ($e in $all) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $TileTimeout -and -not $tileEl) {
+        foreach ($e in $app.FindAll($Tree::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
             if ($e.Current.Name -like "*$Tile*") { $tileEl = $e; break }
         }
         if (-not $tileEl) { Start-Sleep -Seconds 2 }
     }
-    if (-not $tileEl) { Write-Log "在 Windows App 里没找到磁贴 '$Tile'。" 'WARN'; return }
-    Write-Log "找到磁贴 '$($tileEl.Current.Name)'，双击连接。"
+    if (-not $tileEl) { throw "没找到磁贴 '$Tile'" }
+    Write-Log "找到磁贴 '$($tileEl.Current.Name)'，连接中…"
 
-    # --- 双击磁贴（优先 InvokePattern，失败则模拟鼠标双击）---
-    $invoked = $false
-    try {
-        $ip = $tileEl.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-        $ip.Invoke(); $invoked = $true
-    } catch {}
-    if (-not $invoked) {
-        try {
-            $pt = $tileEl.GetClickablePoint()
-        } catch {
-            $r = $tileEl.Current.BoundingRectangle
-            $pt = New-Object System.Windows.Point(($r.X + $r.Width/2), ($r.Y + $r.Height/2))
-        }
-        [Win32Mouse]::DoubleClick([int]$pt.X, [int]$pt.Y)
-    }
+    try { $tileEl.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
+    catch { $p = Get-Point $tileEl; [W]::DoubleClick([int]$p.X, [int]$p.Y) }
 
-    # --- 等待凭据窗口（约 2 分钟后才弹）---
-    Write-Log "等待凭据窗口弹出（最长 $CredTimeout 秒）…"
-    $credWin = $null
+    # 等凭据窗口
+    $cred = Find-TopWindow {
+        param($w)
+        $c = ''; try { $c = $w.Current.ClassName } catch {}
+        $c -eq 'Credential Dialog Xaml Host' -or $w.Current.Name -match 'Windows (Security|セキュリティ)'
+    } $CredTimeout
+    if (-not $cred) { throw "没有出现凭据窗口（可能已记住密码/已连接）" }
+
+    $hCred = [IntPtr]$cred.Current.NativeWindowHandle
+    Write-Log ("凭据窗口: Name='{0}' hwnd={1}" -f $cred.Current.Name, $hCred)
+
+    # 关键：先把凭据窗口强行拉到前台，否则按键会发给当时的前台窗口
+    [W]::Foreground($hCred)
+    Start-Sleep -Milliseconds 600
+    $fg = [W]::GetForegroundWindow()
+    Write-Log ("前台 hwnd={0} 匹配={1}" -f $fg, ($fg -eq $hCred))
+
+    # CredentialUIBroker 的内部控件对外不可见（UIA 子树为空，定位不到密码框），
+    # 但窗口弹出时焦点默认就在密码框上，SendInput 可以直接打进去。
+    [W]::Back(40)   # 清掉可能的残留字符
+    Write-Log "输入密码并回车…"
+    [W]::Type($pw)
+    $pw = $null
+    Start-Sleep -Milliseconds 500
+    [W]::Enter()
+
+    # 校验：用 IsWindow 判断凭据窗口是否已销毁
+    #（不能用 $cred.Current.Name 抛不抛异常来判断：窗口销毁后它返回空串而非抛错）
     $sw.Restart()
-    while ($sw.Elapsed.TotalSeconds -lt $CredTimeout -and -not $credWin) {
-        Start-Sleep -Seconds 3
-        $wins = $root.FindAll([System.Windows.Automation.TreeScope]::Children,
-                 (New-Object System.Windows.Automation.PropertyCondition(
-                    $AE::ControlTypeProperty, [System.Windows.Automation.ControlType]::Window)))
-        foreach ($w in $wins) {
-            $cls = ''
-            try { $cls = $w.Current.ClassName } catch {}
-            if ($cls -eq 'Credential Dialog Xaml Host' -or $w.Current.Name -like '*Windows*Security*' -or $w.Current.Name -like '*Windows*セキュリティ*') {
-                $credWin = $w; break
-            }
-        }
-    }
-    if (-not $credWin) {
-        Write-Log "没有出现凭据窗口（可能已记住密码/已连接），结束远程连接步骤。" 'WARN'; return
-    }
-    $credClass = ''
-    try { $credClass = $credWin.Current.ClassName } catch {}
-    Write-Log ("凭据窗口已出现：Name='{0}' Class='{1}'" -f $credWin.Current.Name, $credClass)
-
-    # --- SendKeys 转义函数 ---
-    function ConvertTo-SendKeys([string]$s) {
-        ($s.ToCharArray() | ForEach-Object {
-            if ('+^%~(){}[]'.Contains($_)) { "{$_}" } else { [string]$_ }
-        }) -join ''
-    }
-
-    # --- 从 pw.txt 读取密码（取第一行，去掉行尾换行）---
-    if (-not (Test-Path -LiteralPath $PwFile)) {
-        Write-Log "找不到密码文件 $PwFile，请在该文件里写入密码。" 'ERROR'; return
-    }
-    $plain = (Get-Content -LiteralPath $PwFile -TotalCount 1 -Encoding UTF8)
-    if ($null -eq $plain) { $plain = '' }
-    $plain = $plain.TrimEnd("`r", "`n")
-    if ([string]::IsNullOrEmpty($plain)) {
-        Write-Log "密码文件 $PwFile 为空。" 'ERROR'; return
-    }
-
-    # # --- 提醒：向凭据窗口注入需要管理员（UIPI）；非管理员通常会失败 ---
-    # $amAdmin = $false
-    # try { $amAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch {}
-    # if (-not $amAdmin) {
-    #     Write-Log "警告：当前非管理员，向凭据窗口注入密码很可能被 UIPI 拦截而失败。建议用提权窗口运行，或让计划任务以最高权限运行。" 'WARN'
-    # }
-
-    # # --- 强制把凭据窗口拉到前台（突破前台锁定）---
-    # $h = [IntPtr]::Zero
-    # try { $h = [IntPtr]$credWin.Current.NativeWindowHandle } catch {}
-    # if ($h -ne [IntPtr]::Zero) {
-    #     [NativeWin]::ForceForeground($h)
-    #     $fgNow = [NativeWin]::Foreground()
-    #     Write-Log "已把凭据窗口拉到前台 (目标 hwnd=$h，当前前台 hwnd=$fgNow，匹配=$([IntPtr]$fgNow -eq $h))。"
-    # } else {
-    #     Write-Log "拿不到凭据窗口句柄，回退用 SetFocus。" 'WARN'
-    #     try { [void]$credWin.SetFocus() } catch {}
-    # }
-    # Start-Sleep -Milliseconds 2000
-
-    # # --- 尽量把焦点放到密码框（失败也无妨，弹窗默认就在密码框）---
-    # try {
-    #     $editCond = New-Object System.Windows.Automation.PropertyCondition(
-    #         $AE::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
-    #     $edits = $credWin.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCond)
-    #     Write-Log "凭据窗口里枚举到 $($edits.Count) 个 Edit 控件。"
-    #     $pwdField = $null
-    #     foreach ($e in $edits) {
-    #         $isPwd = $false
-    #         try { $isPwd = [bool]$e.GetCurrentPropertyValue($AE::IsPasswordProperty) } catch {}
-    #         if ($isPwd) { $pwdField = $e; break }
-    #     }
-    #     if ($pwdField) { [void]$pwdField.SetFocus(); Write-Log "已聚焦密码框。" }
-    #     else { Write-Log "未定位到密码框，使用窗口默认焦点。" }
-    # } catch { Write-Log "聚焦密码框时出错: $($_.Exception.Message)" 'WARN' }
-    Start-Sleep -Milliseconds 300
-
-    # --- 用 SendInput(Unicode) 逐字符输入密码，再回车提交 ---
-    Write-Log "输入密码 (SendInput Unicode) 并回车…"
-    [NativeWin]::TypeString($plain)
-    Start-Sleep -Milliseconds 1000
-    [NativeWin]::PressEnter()
-    $plain = $null
-    Write-Log "远程连接步骤完成。"
+    while ($sw.Elapsed.TotalSeconds -lt 20 -and [W]::IsWindow($hCred)) { Start-Sleep -Seconds 1 }
+    if (-not [W]::IsWindow($hCred)) { Write-Log "凭据窗口已关闭，密码提交成功。" }
+    else { Write-Log "凭据窗口仍在，密码可能未被接受。" 'WARN' }
 }
 
 if (-not $SkipRemotePc) {
